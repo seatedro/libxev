@@ -357,7 +357,7 @@ pub const Loop = struct {
                     const completion: *Completion = @ptrFromInt(entry.lpCompletionKey);
                     completion.result = .{ .job_object = .{
                         .message = .{
-                            .type = @enumFromInt(entry.dwNumberOfBytesTransferred),
+                            .type = @fromBackingInt(@intCast(entry.dwNumberOfBytesTransferred)),
                             .value = @intFromPtr(entry.lpOverlapped),
                         },
                     } };
@@ -709,7 +709,7 @@ pub const Loop = struct {
                     1,
                     null,
                     &flags,
-                    &v.addr,
+                    &v.addr.any,
                     @as(*i32, @ptrCast(&v.addr_size)),
                     &completion.overlapped,
                     null,
@@ -1322,8 +1322,9 @@ pub const Operation = union(OperationType) {
     recvfrom: struct {
         fd: windows.HANDLE,
         buffer: ReadBuffer,
-        addr: posix.sockaddr = undefined,
-        addr_size: posix.socklen_t = @sizeOf(posix.sockaddr),
+        /// Large enough for an IPv6 sender.
+        addr: net.Address = undefined,
+        addr_size: posix.socklen_t = @sizeOf(net.Address),
         wsa_buffer: windows.WSABUF = undefined,
     },
 

@@ -439,8 +439,13 @@ pub const Loop = struct {
                 // Decrease our waiters because we are definitely processing one.
                 wait_rem -|= 1;
 
-                // Completion queue items MUST have a result set.
-                const action = c.callback(c.userdata, self, c, c.result.?);
+                // Completion queue items MUST have a result set. It is
+                // cleared here: `stop_completion` takes a set result to
+                // mean the completion is in this queue, and a rearmed
+                // completion must not keep it.
+                const result = c.result.?;
+                c.result = null;
+                const action = c.callback(c.userdata, self, c, result);
                 switch (action) {
                     // If we're active we have to schedule a delete. Otherwise
                     // we do nothing because we were never part of the kqueue.
@@ -456,8 +461,15 @@ pub const Loop = struct {
                         if (c_active) self.active -= 1;
                     },
 
-                    // Only resubmit if we aren't already active (in the queue)
-                    .rearm => if (!c_active) self.submissions.push(c),
+                    // A completion the kqueue still watches stays active.
+                    // Any other is submitted again; `start` counts it as
+                    // active once more.
+                    .rearm => if (disarm_ev != null) {
+                        c.flags.state = .active;
+                    } else {
+                        if (c_active) self.active -= 1;
+                        self.add(c);
+                    },
                 }
 
                 // If we filled the events slice, we break to avoid overflow.
@@ -1247,8 +1259,8 @@ pub const Completion = struct {
                         const ev = ev_ orelse
                             break :res .{ .read = error.MissingKevent };
                         break :empty @intCast(ev.data);
-                    } else xev_posix.recvfrom(op.fd, v, 0, &op.addr, &op.addr_size) catch |err| mapReadError(err),
-                    .array => |*v| xev_posix.recvfrom(op.fd, v, 0, &op.addr, &op.addr_size) catch |err| mapReadError(err),
+                    } else xev_posix.recvfrom(op.fd, v, 0, &op.addr.any, &op.addr_size) catch |err| mapReadError(err),
+                    .array => |*v| xev_posix.recvfrom(op.fd, v, 0, &op.addr.any, &op.addr_size) catch |err| mapReadError(err),
                 };
 
                 break :res .{
@@ -1292,7 +1304,7 @@ pub const Completion = struct {
     /// in the situation that kqueue fails to enqueue the completion or
     /// a raw syscall fails.
     fn syscall_result(c: *Completion, r: i32) Result {
-        const errno: posix.E = if (r >= 0) .SUCCESS else @enumFromInt(-r);
+        const errno: posix.E = if (r >= 0) .SUCCESS else @fromBackingInt(@intCast(-r));
         return switch (c.op) {
             .noop => unreachable,
 
@@ -1553,7 +1565,7 @@ fn getsockoptError(socket: posix.socket_t) ConnectError!void {
     }
 
     if (err_code == 0) return;
-    return switch (@as(posix.E, @enumFromInt(@as(u16, @intCast(err_code))))) {
+    return switch (@as(posix.E, @fromBackingInt(@intCast(@as(u16, @intCast(err_code)))))) {
         .ADDRNOTAVAIL => error.AddressUnavailable,
         .AFNOSUPPORT => error.AddressFamilyUnsupported,
         .ACCES, .PERM => error.AccessDenied,
@@ -1652,8 +1664,9 @@ pub const Operation = union(OperationType) {
     recvfrom: struct {
         fd: posix.fd_t,
         buffer: ReadBuffer,
-        addr: posix.sockaddr = undefined,
-        addr_size: posix.socklen_t = @sizeOf(posix.sockaddr),
+        /// Large enough for an IPv6 sender.
+        addr: net.Address = undefined,
+        addr_size: posix.socklen_t = @sizeOf(net.Address),
     },
 
     close: struct {
@@ -1926,7 +1939,7 @@ fn kevent_syscall(
 
 /// Converts a posix errno to the negative i32 format expected by syscall_result.
 inline fn errno_to_result(errno: posix.E) i32 {
-    return -@as(i32, @intCast(@intFromEnum(errno)));
+    return -@as(i32, @intCast(@backingInt(errno)));
 }
 
 /// kevent_init initializes a Kevent from a std.c.Kevent. This is used when
@@ -2714,7 +2727,7 @@ test "kqueue: mach port" {
 
     // Send a message to the port
     var msg: darwin.mach_msg_header_t = .{
-        .msgh_bits = @intFromEnum(posix.system.MACH.MSG.TYPE.MAKE_SEND_ONCE),
+        .msgh_bits = @backingInt(posix.system.MACH.MSG.TYPE.MAKE_SEND_ONCE),
         .msgh_size = @sizeOf(darwin.mach_msg_header_t),
         .msgh_remote_port = mach_port,
         .msgh_local_port = darwin.MACH_PORT_NULL,
@@ -2829,7 +2842,7 @@ test "kqueue: timer armed from delayed callback must not fire early" {
             ) catch unreachable;
 
             var msg: darwin.mach_msg_header_t = .{
-                .msgh_bits = @intFromEnum(posix.system.MACH.MSG.TYPE.MAKE_SEND_ONCE),
+                .msgh_bits = @backingInt(posix.system.MACH.MSG.TYPE.MAKE_SEND_ONCE),
                 .msgh_size = @sizeOf(darwin.mach_msg_header_t),
                 .msgh_remote_port = port,
                 .msgh_local_port = darwin.MACH_PORT_NULL,

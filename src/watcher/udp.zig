@@ -6,6 +6,13 @@ const stream = @import("stream.zig");
 const common = @import("common.zig");
 const ThreadPool = @import("../ThreadPool.zig");
 const net = @import("../posix.zig").net;
+
+/// The sender of a datagram from recvfrom. A failed read, a cancellation
+/// among them, leaves the address unset, and 0.0.0.0:0 is reported.
+fn senderAddress(result: anytype, addr: *const net.Address) std.Io.net.IpAddress {
+    _ = result catch return .{ .ip4 = .{ .bytes = @splat(0), .port = 0 } };
+    return addr.toIpAddress();
+}
 const xev_posix = @import("../posix.zig");
 
 /// UDP client and server.
@@ -134,7 +141,7 @@ fn UDPSendto(comptime xev: type) type {
                                     l_inner,
                                     c_inner,
                                     s_inner,
-                                    net.Address.initPosix(@alignCast(&c_inner.op.recvfrom.addr)).toIpAddress(),
+                                    senderAddress(r.recvfrom, &c_inner.op.recvfrom.addr),
                                     initFd(c_inner.op.recvfrom.fd),
                                     c_inner.op.recvfrom.buffer,
                                     r.recvfrom,
@@ -315,7 +322,7 @@ fn UDPSendtoIOCP(comptime xev: type) type {
                                     l_inner,
                                     c_inner,
                                     s_inner,
-                                    net.Address.initPosix(@alignCast(&c_inner.op.recvfrom.addr)).toIpAddress(),
+                                    senderAddress(r.recvfrom, &c_inner.op.recvfrom.addr),
                                     initFd(c_inner.op.recvfrom.fd),
                                     c_inner.op.recvfrom.buffer,
                                     r.recvfrom,
@@ -552,7 +559,7 @@ fn UDPSendMsg(comptime xev: type) type {
                             l_inner,
                             c_inner,
                             s_inner,
-                            net.Address.initPosix(@ptrCast(&s_inner.op.recv.addr_buffer)).toIpAddress(),
+                            senderAddress(r.recvmsg, @ptrCast(@alignCast(&s_inner.op.recv.addr_buffer))),
                             initFd(c_inner.op.recvmsg.fd),
                             s_inner.op.recv.buf,
                             if (r.recvmsg) |v| v else |err| err,
@@ -912,6 +919,25 @@ fn UDPDynamic(comptime xev: type) type {
 
 fn UDPTests(comptime xev: type, comptime Impl: type) type {
     return struct {
+        fn closeAll(loop: *xev.Loop, sockets: []const Impl) !void {
+            var completions: [2]xev.Completion = undefined;
+            for (sockets, completions[0..sockets.len]) |socket, *c| {
+                socket.close(loop, c, void, null, (struct {
+                    fn callback(
+                        _: ?*void,
+                        _: *xev.Loop,
+                        _: *xev.Completion,
+                        _: Impl,
+                        r: xev.CloseError!void,
+                    ) xev.CallbackAction {
+                        _ = r catch unreachable;
+                        return .disarm;
+                    }
+                }).callback);
+            }
+            try loop.run(.until_done);
+        }
+
         test "UDP: Stream decls" {
             if (!@hasDecl(Impl, "S")) return;
             const Stream = Impl.S;
@@ -922,6 +948,184 @@ fn UDPTests(comptime xev: type, comptime Impl: type) type {
                     @compileError("missing decl: " ++ decl.name);
                 }
             }
+        }
+
+        test "UDP: the sender of an IPv6 datagram" {
+            if (builtin.os.tag == .freebsd) return error.SkipZigTest;
+            const testing = std.testing;
+
+            // Closing needs a thread pool on some backends.
+            var tpool = ThreadPool.init(.{});
+            defer tpool.deinit();
+            defer tpool.shutdown();
+            var loop = try xev.Loop.init(.{ .thread_pool = &tpool });
+            defer loop.deinit();
+
+            const server_address = try std.Io.net.IpAddress.parse("::1", 3136);
+            const client_address = try std.Io.net.IpAddress.parse("::1", 3137);
+            const server = try Impl.init(server_address);
+            const client = try Impl.init(client_address);
+            try server.bind(server_address);
+            try client.bind(client_address);
+
+            var c_read: xev.Completion = undefined;
+            var s_read: Impl.State = undefined;
+            var recv_buf: [128]u8 = undefined;
+            var from: ?std.Io.net.IpAddress = null;
+            server.read(&loop, &c_read, &s_read, .{ .slice = &recv_buf }, ?std.Io.net.IpAddress, &from, (struct {
+                fn callback(
+                    ud: ?*?std.Io.net.IpAddress,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    _: *Impl.State,
+                    addr: std.Io.net.IpAddress,
+                    _: Impl,
+                    _: xev.ReadBuffer,
+                    r: xev.ReadError!usize,
+                ) xev.CallbackAction {
+                    _ = r catch unreachable;
+                    ud.?.* = addr;
+                    return .disarm;
+                }
+            }).callback);
+
+            var send_buf = [_]u8{ 1, 2, 3 };
+            var c_write: xev.Completion = undefined;
+            var s_write: Impl.State = undefined;
+            client.write(&loop, &c_write, &s_write, server_address, .{ .slice = &send_buf }, void, null, (struct {
+                fn callback(
+                    _: ?*void,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    _: *Impl.State,
+                    _: Impl,
+                    _: xev.WriteBuffer,
+                    r: xev.WriteError!usize,
+                ) xev.CallbackAction {
+                    _ = r catch unreachable;
+                    return .disarm;
+                }
+            }).callback);
+
+            try loop.run(.until_done);
+
+            // The whole address, not the part that fits a struct sockaddr.
+            try testing.expectEqualSlices(u8, &client_address.ip6.bytes, &from.?.ip6.bytes);
+            try testing.expectEqual(client_address.getPort(), from.?.getPort());
+
+            try closeAll(&loop, &.{ server, client });
+        }
+
+        test "UDP: canceling a read before any datagram" {
+            if (builtin.os.tag == .freebsd) return error.SkipZigTest;
+            if (xev.dynamic) return error.SkipZigTest;
+
+            // Closing needs a thread pool on some backends.
+            var tpool = ThreadPool.init(.{});
+            defer tpool.deinit();
+            defer tpool.shutdown();
+            var loop = try xev.Loop.init(.{ .thread_pool = &tpool });
+            defer loop.deinit();
+
+            const address = try std.Io.net.IpAddress.parse("127.0.0.1", 3138);
+            const server = try Impl.init(address);
+            try server.bind(address);
+
+            // The callback may run with error.Canceled, or not at all.
+            var c_read: xev.Completion = undefined;
+            var s_read: Impl.State = undefined;
+            var recv_buf: [128]u8 = undefined;
+            server.read(&loop, &c_read, &s_read, .{ .slice = &recv_buf }, void, null, (struct {
+                fn callback(
+                    _: ?*void,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    _: *Impl.State,
+                    _: std.Io.net.IpAddress,
+                    _: Impl,
+                    _: xev.ReadBuffer,
+                    r: xev.ReadError!usize,
+                ) xev.CallbackAction {
+                    _ = r catch return .disarm;
+                    unreachable;
+                }
+            }).callback);
+            try loop.run(.no_wait);
+
+            var c_cancel: xev.Completion = .{ .op = .{ .cancel = .{ .c = &c_read } } };
+            loop.add(&c_cancel);
+            try loop.run(.until_done);
+
+            try closeAll(&loop, &.{server});
+        }
+
+        test "UDP: canceling a rearmed read whose datagram was waiting" {
+            if (builtin.os.tag == .freebsd) return error.SkipZigTest;
+            if (xev.dynamic) return error.SkipZigTest;
+            const testing = std.testing;
+
+            // Closing needs a thread pool on some backends.
+            var tpool = ThreadPool.init(.{});
+            defer tpool.deinit();
+            defer tpool.shutdown();
+            var loop = try xev.Loop.init(.{ .thread_pool = &tpool });
+            defer loop.deinit();
+
+            const address = try std.Io.net.IpAddress.parse("127.0.0.1", 3139);
+            const server = try Impl.init(address);
+            const client = try Impl.init(address);
+            try server.bind(address);
+
+            // The datagram arrives before the read is registered.
+            var send_buf = [_]u8{ 1, 2, 3 };
+            var c_write: xev.Completion = undefined;
+            var s_write: Impl.State = undefined;
+            client.write(&loop, &c_write, &s_write, address, .{ .slice = &send_buf }, void, null, (struct {
+                fn callback(
+                    _: ?*void,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    _: *Impl.State,
+                    _: Impl,
+                    _: xev.WriteBuffer,
+                    r: xev.WriteError!usize,
+                ) xev.CallbackAction {
+                    _ = r catch unreachable;
+                    return .disarm;
+                }
+            }).callback);
+            try loop.run(.until_done);
+
+            // The read takes it and rearms.
+            var c_read: xev.Completion = undefined;
+            var s_read: Impl.State = undefined;
+            var recv_buf: [128]u8 = undefined;
+            var received: usize = 0;
+            server.read(&loop, &c_read, &s_read, .{ .slice = &recv_buf }, usize, &received, (struct {
+                fn callback(
+                    ud: ?*usize,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    _: *Impl.State,
+                    _: std.Io.net.IpAddress,
+                    _: Impl,
+                    _: xev.ReadBuffer,
+                    r: xev.ReadError!usize,
+                ) xev.CallbackAction {
+                    _ = r catch return .disarm;
+                    ud.?.* += 1;
+                    return .rearm;
+                }
+            }).callback);
+            while (received == 0) try loop.run(.once);
+            try testing.expectEqual(1, received);
+
+            // The cancel has to find it, or the loop never finishes.
+            var c_cancel: xev.Completion = .{ .op = .{ .cancel = .{ .c = &c_read } } };
+            loop.add(&c_cancel);
+            try loop.run(.until_done);
+
+            try closeAll(&loop, &.{ server, client });
         }
 
         test "UDP: read/write" {
