@@ -575,7 +575,10 @@ pub const Loop = struct {
             }
 
             // If we ran through the loop once we break if we don't care.
-            if (wait == 0) break;
+            // Deletions from disarms in this pass are submitted first: a
+            // knote left in the kqueue fires again on a later tick, calling
+            // the disarmed completion and decrementing `active` twice.
+            if (wait == 0 and changes == 0) break;
         }
     }
 
@@ -2871,6 +2874,54 @@ test "kqueue: timer armed from delayed callback must not fire early" {
     const elapsed_ns = state.timer_fired_ns - state.timer_started_ns;
     const elapsed_ms: i128 = @divFloor(elapsed_ns, std.time.ns_per_ms);
     try testing.expect(elapsed_ms >= @as(i128, @intCast(timer_delay_ms)));
+}
+
+test "kqueue: a completion disarmed in a no_wait tick isn't called again" {
+    const testing = std.testing;
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try testing.expectEqual(0, std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    var calls: usize = 0;
+    var buf: [1]u8 = undefined;
+    var c: Completion = .{
+        .op = .{ .read = .{ .fd = fds[0], .buffer = .{ .slice = &buf } } },
+        .userdata = &calls,
+        .callback = (struct {
+            fn callback(ud: ?*anyopaque, _: *Loop, _: *Completion, _: Result) CallbackAction {
+                const n: *usize = @ptrCast(@alignCast(ud.?));
+                n.* += 1;
+                return .disarm;
+            }
+        }).callback,
+    };
+    loop.add(&c);
+
+    // A pending timer keeps the loop polling the kqueue after the read
+    // disarms.
+    var c_timer: Completion = undefined;
+    loop.timer(&c_timer, 60_000, null, (struct {
+        fn callback(_: ?*anyopaque, _: *Loop, _: *Completion, _: Result) CallbackAction {
+            return .disarm;
+        }
+    }).callback);
+    try loop.run(.no_wait);
+
+    // The first byte fires the read, which disarms in a tick that doesn't
+    // wait.
+    try testing.expectEqual(1, std.c.write(fds[1], "a", 1));
+    while (calls == 0) try loop.run(.no_wait);
+
+    // The second byte must not reach the disarmed completion.
+    try testing.expectEqual(1, std.c.write(fds[1], "b", 1));
+    for (0..10) |_| try loop.run(.no_wait);
+    try testing.expectEqual(1, calls);
+    try testing.expectEqual(1, loop.active);
 }
 
 test "kqueue: socket accept/cancel cancellation should decrease active count" {
